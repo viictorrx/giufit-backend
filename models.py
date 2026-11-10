@@ -11,7 +11,9 @@ class PratoDB(Base):
     ativo = Column(Boolean, default=True)
     
     # Isso faz a ligação (Relacionamento) com a tabela de tamanhos
-    opcoes = relationship("OpcaoTamanhoDB", back_populates="prato")
+    opcoes = relationship(
+        "OpcaoTamanhoDB", back_populates="prato", cascade="all, delete-orphan"
+    )
 
 
 class OpcaoTamanhoDB(Base):
