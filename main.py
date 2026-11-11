@@ -1,9 +1,10 @@
 import logging
 import os
 import secrets
+from datetime import datetime, timezone
 from typing import List
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -105,9 +106,34 @@ def require_admin(request: Request, authorization: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Não autorizado")
 
 
+# ----------------------------------------------------
+# FOTOS
+# ----------------------------------------------------
+MAX_FOTO_BYTES = 600 * 1024  # o site reduz a imagem antes de enviar (~100-250 KB)
+
+
+def _tipo_da_imagem(dados: bytes):
+    """Descobre o tipo pelo conteúdo real (nunca confia no que o cliente diz)."""
+    if dados.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if dados.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if dados[:4] == b"RIFF" and dados[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _foto_url(p: models.PratoDB):
+    if not p.foto:
+        return None
+    versao = int(p.foto.atualizado_em.timestamp()) if p.foto.atualizado_em else 0
+    return f"/pratos/{p.id}/foto?v={versao}"
+
+
 def _serializar(p: models.PratoDB) -> dict:
     return {
         "id": p.id,
+        "foto_url": _foto_url(p),
         "nome": p.nome,
         "descricao": p.descricao,
         "ativo": p.ativo,
@@ -212,3 +238,69 @@ def deletar_prato(request: Request, prato_id: int, db: Session = Depends(get_db)
         raise HTTPException(status_code=500, detail="Erro interno ao excluir")
     log.info("Prato excluído id=%s", prato_id)
     return {"mensagem": f"Marmita ID {prato_id} excluída com sucesso!"}
+
+
+@app.get("/pratos/{prato_id}/foto")
+def ver_foto(prato_id: int, db: Session = Depends(get_db)):
+    """Entrega a foto do prato (pública, com cache longo; a URL muda quando a foto muda)."""
+    foto = db.query(models.FotoPratoDB).filter(models.FotoPratoDB.prato_id == prato_id).first()
+    if not foto:
+        raise HTTPException(status_code=404, detail="Sem foto")
+    return Response(
+        content=foto.conteudo,
+        media_type=foto.tipo,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.put("/pratos/{prato_id}/foto", dependencies=[Depends(require_admin)])
+@limiter.limit("20/minute")
+async def enviar_foto(request: Request, prato_id: int, db: Session = Depends(get_db)):
+    """Recebe a imagem crua no corpo da requisição (JPEG, PNG ou WebP, até 600 KB)."""
+    prato = db.query(models.PratoDB).filter(models.PratoDB.id == prato_id).first()
+    if not prato:
+        raise HTTPException(status_code=404, detail="Marmita não encontrada")
+
+    declarado = request.headers.get("content-length")
+    if declarado and declarado.isdigit() and int(declarado) > MAX_FOTO_BYTES:
+        raise HTTPException(status_code=413, detail="Imagem muito grande (máx. 600 KB)")
+    dados = await request.body()
+    if not dados:
+        raise HTTPException(status_code=400, detail="Nenhuma imagem enviada")
+    if len(dados) > MAX_FOTO_BYTES:
+        raise HTTPException(status_code=413, detail="Imagem muito grande (máx. 600 KB)")
+    tipo = _tipo_da_imagem(dados)
+    if not tipo:
+        raise HTTPException(status_code=415, detail="Envie uma imagem JPEG, PNG ou WebP")
+
+    try:
+        agora = datetime.now(timezone.utc).replace(tzinfo=None)
+        if prato.foto:
+            prato.foto.tipo, prato.foto.conteudo, prato.foto.atualizado_em = tipo, dados, agora
+        else:
+            prato.foto = models.FotoPratoDB(tipo=tipo, conteudo=dados, atualizado_em=agora)
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("Erro ao salvar foto do prato id=%s", prato_id)
+        raise HTTPException(status_code=500, detail="Erro interno ao salvar a foto")
+    log.info("Foto salva prato=%s tipo=%s bytes=%s", prato_id, tipo, len(dados))
+    db.refresh(prato)
+    return {"mensagem": "Foto salva!", "foto_url": _foto_url(prato)}
+
+
+@app.delete("/pratos/{prato_id}/foto", dependencies=[Depends(require_admin)])
+@limiter.limit("30/minute")
+def remover_foto(request: Request, prato_id: int, db: Session = Depends(get_db)):
+    prato = db.query(models.PratoDB).filter(models.PratoDB.id == prato_id).first()
+    if not prato:
+        raise HTTPException(status_code=404, detail="Marmita não encontrada")
+    try:
+        if prato.foto:
+            db.delete(prato.foto)
+            db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("Erro ao remover foto do prato id=%s", prato_id)
+        raise HTTPException(status_code=500, detail="Erro interno ao remover a foto")
+    return {"mensagem": "Foto removida"}
